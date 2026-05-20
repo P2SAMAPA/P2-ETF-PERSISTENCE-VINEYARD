@@ -1,0 +1,8 @@
+numpy
+pandas
+scipy
+networkx
+gudhi
+huggingface-hub
+streamlit
+plotly
