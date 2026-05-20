@@ -21,8 +21,8 @@ UNIVERSES = {
 WINDOWS = [63, 252, 504, 1008, 2016]
 
 # Persistence vineyard parameters
-INNER_WIN = 60           # length of sub‑window for each persistence diagram (days)
-N_SEQ = 20               # number of consecutive sub‑windows to build vineyard
+INNER_WIN = 30           # length of sub‑window for each persistence diagram (days)
+N_SEQ = 10               # number of consecutive sub‑windows to build vineyard
 
 # Filtration: use correlation graph (edge weight = abs(corr))
 # Persistence dimension (0 = components, 1 = loops)
