@@ -1,11 +1,12 @@
 import pandas as pd
 import numpy as np
+import networkx as nx   # <-- added
 from pathlib import Path
 import json
 from datetime import datetime
 import config
 import data_manager
-from vineyard import compute_persistence_diagram, build_vineyards, compute_etf_scores_from_vines
+from vineyard import compute_persistence_diagram, build_vineyards, compute_etf_scores_from_vines, get_representative_cycle
 
 def convert_to_serializable(obj):
     if isinstance(obj, np.ndarray):
@@ -43,15 +44,10 @@ def main():
                 print(f"  Skipping window {win}d (insufficient data)")
                 continue
             print(f"  Processing window {win}d...")
-            # We need diagrams for consecutive windows? For a single window, we cannot build vines.
-            # So we use the per‑window persistence directly (fallback).
-            # Alternatively, we can slide a smaller sub‑window for vineyard tracking.
-            # To keep it simple and robust, we'll compute the most persistent 1‑dim loop for this window and use its centrality as score.
-            # This avoids the complexity of multi‑window vineyard.
-            # Use the same function but treat as single window.
+            # Compute persistence diagram and simplex tree for this window
             diag, stree = compute_persistence_diagram(returns, win, dim=1)
             if diag is None or len(diag) == 0:
-                # fallback to eigenvector centrality of full correlation graph
+                # Fallback: eigenvector centrality of full correlation graph
                 ret_win = returns.iloc[-win:]
                 corr = ret_win.corr().abs().values
                 G = nx.Graph()
@@ -59,21 +55,17 @@ def main():
                     G.add_node(i)
                 for i in range(len(tickers)):
                     for j in range(i+1, len(tickers)):
-                        if corr[i,j] > 0.1:
-                            G.add_edge(i, j, weight=corr[i,j])
+                        if corr[i, j] > 0.1:
+                            G.add_edge(i, j, weight=corr[i, j])
                 try:
                     cent = nx.eigenvector_centrality_numpy(G, weight='weight')
                 except:
                     cent = {i: 1.0/len(tickers) for i in range(len(tickers))}
                 scores = {tickers[i]: cent[i] for i in range(len(tickers))}
             else:
-                # Find the most persistent point (largest death-birth)
+                # Find most persistent point (largest death‑birth)
                 best_point = max(diag, key=lambda x: x[1]-x[0])
                 b, d = best_point
-                # Get representative cycle edges
-                # We need to implement get_representative_cycle from vineyard.py
-                # We'll import it; assume it's there.
-                from vineyard import get_representative_cycle
                 cycle_edges = get_representative_cycle(stree, b, d)
                 if not cycle_edges:
                     # fallback to eigenvector centrality of whole graph
@@ -84,8 +76,8 @@ def main():
                         G.add_node(i)
                     for i in range(len(tickers)):
                         for j in range(i+1, len(tickers)):
-                            if corr[i,j] > 0.1:
-                                G.add_edge(i, j, weight=corr[i,j])
+                            if corr[i, j] > 0.1:
+                                G.add_edge(i, j, weight=corr[i, j])
                     try:
                         cent = nx.eigenvector_centrality_numpy(G, weight='weight')
                     except:
