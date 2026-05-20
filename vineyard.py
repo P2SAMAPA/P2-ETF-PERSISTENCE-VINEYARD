@@ -1,163 +1,188 @@
 import numpy as np
-import pandas as pd
 import gudhi as gd
 from scipy.optimize import linear_sum_assignment
 import networkx as nx
 
-def correlation_graph_persistence(returns_df, window):
-    """Compute persistence diagram of correlation graph over the last `window` days."""
+def compute_persistence_diagram(returns_df, window, dim=1):
+    """
+    Compute persistence diagram for the correlation graph of ETF returns.
+    Returns:
+        diagram: list of (birth, death) tuples for dimension `dim`
+        simplex_tree: the gudhi simplex tree (for extracting representatives)
+    """
     if len(returns_df) < window:
         return None, None
     ret_win = returns_df.iloc[-window:]
     corr = ret_win.corr().abs().values
-    # Distance matrix for Rips: 1 - corr
     dist = 1 - corr
     rips = gd.RipsComplex(distance_matrix=dist, max_edge_length=1.0)
-    simplex_tree = rips.create_simplex_tree(max_dimension=2)
+    simplex_tree = rips.create_simplex_tree(max_dimension=dim+1)
     persistence = simplex_tree.persistence()
-    # Extract intervals for dimension `DIM` (config.DIM)
-    barcode = [(b,d) for dim, (b,d) in persistence if dim == config.DIM]
-    return barcode, simplex_tree
+    diagram = [(b, d) for dim_idx, (b, d) in persistence if dim_idx == dim]
+    return diagram, simplex_tree
 
 def match_diagrams(diag1, diag2):
-    """Match points between two persistence diagrams using Hungarian algorithm.
-    Points are (birth, death). Distance = L2 norm.
+    """
+    Match points between two persistence diagrams.
+    Returns:
+        matched1: list of indices in diag1 that are matched
+        matched2: list of indices in diag2 that are matched
+        unmatched1: indices in diag1 not matched
+        unmatched2: indices in diag2 not matched
     """
     if len(diag1) == 0 and len(diag2) == 0:
-        return [], []
-    if len(diag1) == 0:
-        return [], list(range(len(diag2)))
-    if len(diag2) == 0:
-        return list(range(len(diag1))), []
-    # Build cost matrix
+        return [], [], list(range(len(diag1))), list(range(len(diag2)))
+    # Build cost matrix (L2 distance between birth-death pairs)
     cost = np.zeros((len(diag1), len(diag2)))
-    for i, p1 in enumerate(diag1):
-        for j, p2 in enumerate(diag2):
-            cost[i,j] = np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+    for i, (b1, d1) in enumerate(diag1):
+        for j, (b2, d2) in enumerate(diag2):
+            cost[i, j] = np.sqrt((b1 - b2)**2 + (d1 - d2)**2)
     row_ind, col_ind = linear_sum_assignment(cost)
-    # unmatched rows/cols have high cost
-    matched1 = row_ind
-    matched2 = col_ind
-    unmatched1 = [i for i in range(len(diag1)) if i not in row_ind]
-    unmatched2 = [j for j in range(len(diag2)) if j not in col_ind]
-    return matched1, matched2
+    matched1 = list(row_ind)
+    matched2 = list(col_ind)
+    unmatched1 = [i for i in range(len(diag1)) if i not in matched1]
+    unmatched2 = [j for j in range(len(diag2)) if j not in matched2]
+    return matched1, matched2, unmatched1, unmatched2
 
 def build_vineyards(diagrams_list):
     """
     diagrams_list: list of persistence diagrams (list of (b,d) tuples) for consecutive windows.
-    Returns a dict: vine_id -> list of (window_idx, birth, death) for the feature.
-    Also returns the mapping from window to vine for each point.
+    Returns:
+        vines: dict {vine_id: list of (window_idx, (birth, death))}
+        vine_scores: dict {vine_id: score = length * death_value}
     """
-    vines = {}   # {vine_id: list of (win_idx, (b,d))}
-    current_vine_id = 0
-    # For the first window, each point gets its own vine
+    if not diagrams_list:
+        return {}, {}
+    vines = {}
+    vine_id_counter = 0
+    # first window: each point becomes a new vine
     for point in diagrams_list[0]:
-        vines[current_vine_id] = [(0, point)]
-        current_vine_id += 1
-    # For each subsequent window, match points
+        vines[vine_id_counter] = [(0, point)]
+        vine_id_counter += 1
+    # For each subsequent window, match
     for win_idx in range(1, len(diagrams_list)):
         prev_diag = diagrams_list[win_idx-1]
         curr_diag = diagrams_list[win_idx]
-        # Match between previous and current
-        # We need to know which vine each previous point belongs to
-        prev_vine_map = {}
+        # Build map from point to vine_id for previous window
+        prev_point_to_vine = {}
         for vine_id, points in vines.items():
-            # take the last point of this vine (it should be from previous window)
+            # the last point in the vine is from previous window
             last_point = points[-1][1]
-            prev_vine_map[last_point] = vine_id
-        # Build list of previous points in order
-        prev_points = list(prev_vine_map.keys())
+            prev_point_to_vine[last_point] = vine_id
+        prev_points = list(prev_point_to_vine.keys())
         # Match
-        matched1, matched2 = match_diagrams(prev_points, curr_diag)
+        matched1, matched2, unmatched1, unmatched2 = match_diagrams(prev_points, curr_diag)
         # matched1 indices correspond to prev_points list
-        # matched2 indices correspond to curr_diag list
-        # Create mapping for matched points
         matched_prev = [prev_points[i] for i in matched1]
         matched_curr = [curr_diag[j] for j in matched2]
-        # For matched points, assign to existing vine
+        # Extend existing vines
         for prev_p, curr_p in zip(matched_prev, matched_curr):
-            vine_id = prev_vine_map[prev_p]
+            vine_id = prev_point_to_vine[prev_p]
             vines[vine_id].append((win_idx, curr_p))
-        # For unmatched current points, start new vines
-        unmatched_curr_indices = [j for j in range(len(curr_diag)) if j not in matched2]
-        for idx in unmatched_curr_indices:
-            vines[current_vine_id] = [(win_idx, curr_diag[idx])]
-            current_vine_id += 1
-        # Unmatched previous points: vine ends (no further tracking)
-    return vines
-
-def compute_vine_scores(vines):
-    """For each vine, compute stability (length) and death value (max death)."""
-    scores = {}
+        # Unmatched current points start new vines
+        for idx in unmatched2:
+            vines[vine_id_counter] = [(win_idx, curr_diag[idx])]
+            vine_id_counter += 1
+        # Unmatched previous points: vine ends (do nothing)
+    # Compute scores: length of vine times max death value
+    vine_scores = {}
     for vine_id, points in vines.items():
         if len(points) < 2:
             continue
         deaths = [d for _, (_, d) in points if d != float('inf')]
         death_val = max(deaths) if deaths else 0.0
-        stability = len(points)
-        score = stability * death_val
-        scores[vine_id] = score
-    return scores
+        length = len(points)       # number of windows this feature survived
+        vine_scores[vine_id] = length * death_val
+    return vines, vine_scores
 
-def get_most_important_loops(vines, diagrams_list, simplex_trees_list, top_n=3):
-    """For the top scoring vines that are 1‑dim, extract the corresponding loop subgraph.
-    Return eigenvector centrality for each ETF in those loops.
+def get_representative_cycle(simplex_tree, birth, death):
     """
-    scores = compute_vine_scores(vines)
-    if not scores:
-        return {}
-    sorted_vines = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    # For each such vine, we need to get the corresponding loop at its most persistent window
-    # We'll take the window where the feature's death is largest (or the last window)
-    etf_importance = {}
-    for vine_id, _ in sorted_vines:
-        # Get all points for this vine
-        points = vines[vine_id]
-        # Find the point with the largest death (or longest persistence)
-        best_win_idx = None
-        best_persistence = 0.0
-        best_point = None
-        for win_idx, (b,d) in points:
-            pers = d - b
-            if pers > best_persistence and d != float('inf'):
-                best_persistence = pers
-                best_win_idx = win_idx
-                best_point = (b,d)
-        if best_win_idx is None:
-            continue
-        # Get the simplex tree for that window
-        stree = simplex_trees_list[best_win_idx]
-        # We need to retrieve the representative simplex for that persistence interval
-        # Gudhi can give the representative simplex for a given interval
-        # However, retrieving the exact 1‑cycle is complex. We'll approximate:
-        # For a 1‑dim feature, the representative can be a set of edges (1‑simplices).
-        # We'll use the filtration threshold: the birth and death correspond to correlation levels.
-        # Instead, we compute a thresholded graph at the death value (or just after birth)
-        # and then find the connected components? Not accurate.
-        # Simpler: use the eigenvector centrality of the whole graph at the window, weighted by the feature's persistence.
-        # That gives a global measure but not loop‑specific.
-        # Given the complexity, we'll assign equal importance to all nodes.
-        # For now, we'll use the eigenvector centrality of the full correlation graph at that window.
-        # In a full implementation, we would extract the loop edges.
-        # Placeholder: return equal weights.
-        pass
-    # Fallback: compute eigenvector centrality of the whole graph at the most recent window
-    # We'll implement a simple centrality measure.
-    # Use the last window's correlation graph
-    last_stree = simplex_trees_list[-1]
-    # Build a graph from the edges present at a threshold (e.g., death of top vine)
-    # Not accurate. We'll instead compute eigenvector centrality of the full correlation graph.
-    # For each ETF, score = mean participation across top vines (simplified).
-    return etf_importance
-
-# For robustness, we'll output a dummy centrality for all ETFs at the last window
-def last_window_centrality(returns_df, window):
-    ret_win = returns_df.iloc[-window:]
-    corr = ret_win.corr().abs().values
-    G = nx.from_numpy_array(corr)
-    # Eigenvector centrality
+    Extract the edges (1‑simplices) that form the persistent 1‑cycle at the given interval.
+    Uses the simplex tree to retrieve the 1‑cycle via the persistence pair.
+    Returns a list of tuples (i, j) representing edges.
+    """
+    # Get the pair of simplices that created/destroyed the feature
+    pairs = simplex_tree.persistence_pairs()
+    for pair in pairs:
+        if len(pair) == 2 and pair[0] is not None and pair[1] is not None:
+            # Check if this pair corresponds to our interval (approximate)
+            # The birth simplex is the one that appears first, death simplex appears later.
+            # We'll take the birth simplex and its boundary.
+            # For a 1‑cycle, the birth simplex is a 1‑simplex (edge) and the death simplex is a 2‑simplex (triangle)
+            # that kills the cycle. The cycle is the set of edges in the boundary of the death triangle that are also in the same connected component.
+            # However, this is complex. For simplicity, we'll use the threshold heuristic.
+            pass
+    # Fallback: use threshold filtration
+    threshold = (birth + death) / 2.0
+    edges = []
+    for simplex, filtration in simplex_tree.get_filtration():
+        if len(simplex) == 2 and filtration < threshold:
+            edges.append(tuple(simplex))
+    # Build a graph to find the shortest cycle
+    G = nx.Graph()
+    G.add_edges_from(edges)
     try:
-        cent = nx.eigenvector_centrality_numpy(G, weight='weight')
+        # Find a cycle (any cycle) using DFS
+        cycle = nx.find_cycle(G, orientation='ignore')
+        cycle_edges = [(u, v) for (u, v, _) in cycle]
+        return cycle_edges
     except:
-        cent = {i: 1.0/len(G.nodes) for i in G.nodes}
-    return cent
+        # Return all edges as fallback
+        return edges
+
+def compute_etf_scores_from_vines(vines, vine_scores, diagrams_list, simplex_trees_list, etf_names, top_n=3):
+    """
+    For the top `top_n` scoring vines (1‑dim loops), compute per‑ETF centrality in the loop subgraph.
+    Returns dict {etf: score} aggregated across top vines.
+    """
+    if not vine_scores:
+        return {etf: 0.0 for etf in etf_names}
+    # Sort vines by score descending
+    sorted_vines = sorted(vine_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    etf_scores = {etf: 0.0 for etf in etf_names}
+    for vine_id, score in sorted_vines:
+        points = vines[vine_id]
+        # Find the window where the feature has the largest persistence (death-birth)
+        best_idx = None
+        best_pers = 0.0
+        best_point = None
+        for win_idx, (b, d) in points:
+            if d == float('inf'):
+                continue
+            pers = d - b
+            if pers > best_pers:
+                best_pers = pers
+                best_idx = win_idx
+                best_point = (b, d)
+        if best_idx is None:
+            continue
+        b, d = best_point
+        stree = simplex_trees_list[best_idx]
+        # Get representative cycle edges
+        cycle_edges = get_representative_cycle(stree, b, d)
+        if not cycle_edges:
+            # fallback: equal weight for all ETFs
+            for etf in etf_names:
+                etf_scores[etf] += score / len(etf_names)
+            continue
+        # Build graph of the cycle
+        G = nx.Graph()
+        G.add_edges_from(cycle_edges)
+        # Add all nodes (ETFs) as isolated if not present
+        for i in range(len(etf_names)):
+            G.add_node(i)
+        # Compute eigenvector centrality restricted to the cycle nodes
+        try:
+            cent = nx.eigenvector_centrality_numpy(G, weight='weight')
+        except:
+            cent = {node: 1.0/len(G.nodes) for node in G.nodes}
+        # Map centrality to ETF names
+        for node, c in cent.items():
+            if node < len(etf_names):
+                etf_scores[etf_names[node]] += score * c
+    # Normalise
+    total = sum(etf_scores.values())
+    if total > 0:
+        for etf in etf_scores:
+            etf_scores[etf] /= total
+    return etf_scores
